@@ -372,6 +372,10 @@ def build_features(
                 for ev in arr:
                     if not isinstance(ev, dict):
                         continue
+                    # ▼▼▼ 추가: hidden/deleted 플래그가 true면 제외 ▼▼▼
+                    if ev.get("hidden") is True or ev.get("deleted") is True:
+                        continue
+                    # ▲▲▲ 여기까지 단 2줄 추가 ▲▲▲
                     t = pick_event_time(ev)
                     if t is None:
                         continue
@@ -536,7 +540,7 @@ def main():
     if args.test:
         input_path = "./input/users_logs.json"  # 테스트 모드 고정 경로
         output_json = "./output/result.json"
-        output_csv = "./output/run.csv"
+        output_csv = "./log/run.csv"
         sido_geojson = args.sido  # 원하면 --sido로 파일 제공 가능
         days = 30 if args.days is None else args.days
     else:
