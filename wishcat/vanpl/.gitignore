@@ -1,0 +1,7 @@
+*.log
+*.csv
+*.json
+*.md
+*.bat
+*.sh
+*.ndjson
