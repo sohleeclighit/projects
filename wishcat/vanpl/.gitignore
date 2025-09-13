@@ -3,6 +3,5 @@
 *.json
 *.md
 *.bat
-*.sh
 *.ndjson
 *.ps1
