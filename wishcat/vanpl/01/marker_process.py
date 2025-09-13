@@ -185,24 +185,29 @@ def transform_markers(markers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     요청 순서대로 전체 파이프라인 수행.
     각 단계 후 원본 입력 순서(_idx)로 정렬해 최종 출력 순서를 보장.
+
+    [변경 사항]
+    - 요건에 따라 **좌표 반올림 후 중복 판정**이 되도록 순서를 조정:
+      (기존) 중복 → 반올림 → 카테고리 → 블랙리스트
+      (변경) 반올림 → 중복 → 카테고리 → 블랙리스트
     """
-    # 1) 중복 제거
-    s1_kept, _ = step1_deduplicate(markers)
-    s1_kept.sort(key=lambda x: x.get("_idx", 1e18))
+    # A) 좌표 반올림 먼저 수행 (요건: 반올림 좌표로 50m 판정)
+    sA = step2_round_coords(markers)
+    sA.sort(key=lambda x: x.get("_idx", 1e18))
 
-    # 2) 좌표 반올림
-    s2_kept = step2_round_coords(s1_kept)
-    s2_kept.sort(key=lambda x: x.get("_idx", 1e18))
+    # B) 중복 제거 (반올림된 좌표 기준 거리 판정)
+    sB, _ = step1_deduplicate(sA)
+    sB.sort(key=lambda x: x.get("_idx", 1e18))
 
-    # 3) 카테고리 필터
-    s3_kept, _ = step3_category_filter(s2_kept)
-    s3_kept.sort(key=lambda x: x.get("_idx", 1e18))
+    # C) 카테고리 필터
+    sC, _ = step3_category_filter(sB)
+    sC.sort(key=lambda x: x.get("_idx", 1e18))
 
-    # 4) 블랙리스트 필터
-    s4_kept, _ = step4_blacklist_filter(s3_kept)
-    s4_kept.sort(key=lambda x: x.get("_idx", 1e18))
+    # D) 블랙리스트 필터
+    sD, _ = step4_blacklist_filter(sC)
+    sD.sort(key=lambda x: x.get("_idx", 1e18))
 
-    return s4_kept
+    return sD
 
 
 # =========================
@@ -214,15 +219,29 @@ def ensure_parent_dir(path: str) -> None:
         os.makedirs(d, exist_ok=True)
 
 
-def append_run_csv(
+# === 변경 1: overwrite 동작 & 변경 2: --log 경로에서 run_id 추출 ===
+def extract_run_id_from_log_path(log_path: str) -> str:
+    """
+    파일명이 run{n}.log 또는 run_{n}.log 이면 n을 run_id로 사용.
+    그렇지 않으면 항상 "1".
+    """
+    base = os.path.basename(log_path or "")
+    m = re.search(r"run_?(\d+)\.log$", base, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return "1"
+
+
+def write_run_csv_overwrite(
     csv_path: str, run_id: str, input_size: int, output_size: int, elapsed_ms: int
 ) -> None:
-    """run.csv에 헤더가 없으면 추가하고, 1줄 append"""
+    """
+    매 실행 시 같은 경로면 덮어쓰기(헤더 + 단일 결과 1행).
+    기존 append 동작을 overwrite로 변경.
+    """
     ensure_parent_dir(csv_path)
-    header_needed = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
-    with open(csv_path, "a", encoding="utf-8", newline="") as f:
-        if header_needed:
-            f.write("run_id,input,output,elapsed_ms\n")
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write("run_id,input,output,elapsed_ms\n")
         f.write(f"{run_id},{input_size},{output_size},{elapsed_ms}\n")
 
 
@@ -258,12 +277,17 @@ def run_once(
 
     elapsed_ms = int((time.time() - t0) * 1000)
 
-    # (2) run.csv append
-    run_id = run_id or uuid.uuid4().hex[:8]
-    append_run_csv(csv_file, run_id, input_size, output_size, elapsed_ms)
+    # (2) run.csv overwrite
+    #     - run_id 우선순위: (a) 인자로 받은 run_id -> (b) --log 경로에서 추출 -> (c) "1"
+    resolved_run_id = (
+        run_id
+        or extract_run_id_from_log_path(csv_file)
+        or "1"
+    )
+    write_run_csv_overwrite(csv_file, resolved_run_id, input_size, output_size, elapsed_ms)
 
     # (3) 콘솔 출력 (요약 + top5만)
-    print(f"elapsed={elapsed_ms}ms, input={input_size}, output={output_size}\n")
+    print(f"elapsed={elapsed_ms}ms, input={input_size}, output={output_size}")
     print("Sample results (top 5):")
     top5 = processed[:5]
     if top5:
@@ -292,7 +316,7 @@ def main():
     if args.test:
         input_file = "./input/sample.json"
         output_file = "./output/result.json"
-        csv_file = "./output/run.csv"  # 테스트 모드: run.csv 강제
+        csv_file = "./output/run.csv"  # 테스트 모드: run.csv 강제 (run_id=1로 기록됨)
     else:
         if not (args.input and args.output and args.log):
             raise SystemExit(

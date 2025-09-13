@@ -3,11 +3,44 @@
 
 """
 Message CTR@1 evaluator (Spec #5)
-- main(): CLI 파싱만
-- run(): 파일 I/O 및 오케스트레이션
-- compute_recommendations(): 점수 계산/Top-1/CTR 산출
 
-[ASSUMPTION] 표시는 명세가 모호해 임의로 결정한 부분을 뜻합니다.
+- CLI:
+    --catalog message_catalog.json
+    --scenarios scenarios_5.json
+    --answers answers_5.json
+    --weights "theme=2.0,tag=1.0,region=1.5,recency=0.5"
+    --topk 1
+    --output ./output/result.json
+    --log ./log/summary.csv
+    [--details ./log/recs.ndjson]
+    [--test]
+
+- 확정 규격 반영:
+  * 문자열 비교: strip만, 대소문자 변경 없음(정확 일치)
+  * ThemeMatch: 태그 정확 일치만 (content 매칭 없음)
+  * TagOverlap: 중복 제거 후 교집합 크기(상한 없음)
+  * RegionMatch: 정확 일치, 누락 시 0점
+  * Simple Mode:
+      - theme ← 정답 첫 태그, 없으면 content에서 한 단어, 실패 시 ""
+      - context.region ← 정답 region
+      - context.time ← 정답 datetime의 시간대 버킷
+      - userHints.prefer ← 정답 tags 앞에서 2개 (원본 순서, unique)
+      - userHints.avoid ← 항상 빈 배열([])로 덮어씀
+  * 시간/날짜:
+      - 입력 datetime의 Z/오프셋 무시, KST로 해석 (시차 변환 없음)
+      - Recency 기준시각 = 실행 시각(now, KST)
+      - days = round
+      - 시간대 버킷(경계 규칙):
+          morning  : [05:00:00, 12:00:00)
+          afternoon: [12:00:00, 17:00:00)
+          evening  : [17:00:00, 22:00:00)
+          night    : [22:00:00, 05:00:00)
+  * 정렬: 점수 내림차순, 동점 시 messageId 문자열(lexicographic) 오름차순
+  * 오류 처리:
+      - answers.json에 없는 scenarioId → 오류 종료
+      - answerMessageId가 catalog에 없음 → 오류 종료
+  * CTR 분모 = len(scenarios)
+  * 출력 시각 문자열: KST 기준이지만 타임존 오프셋 표기 안함 (ISO-like, naive string)
 """
 
 import argparse
@@ -19,8 +52,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Set
 
 # =========================
 # Config / CLI
@@ -39,7 +71,7 @@ class Config:
     w_recency: float
     output_path: Path  # result.json
     summary_csv: Path  # run summary (ctr 등)
-    details_ndjson: Optional[Path]  # recs.ndjson (옵션)
+    details_resultjson: Optional[Path]  # recs.ndjson (옵션)
 
 
 def parse_weights(s: str) -> Dict[str, float]:
@@ -66,9 +98,7 @@ def parse_weights(s: str) -> Dict[str, float]:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Personalized Message CTR@1 evaluator (full)."
-    )
+    p = argparse.ArgumentParser(description="Personalized Message CTR@1 evaluator.")
     # 입력
     p.add_argument(
         "--catalog", dest="catalog_path", type=Path, help="Path to message_catalog.json"
@@ -101,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--details",
-        dest="details_ndjson",
+        dest="details_resultjson",
         type=Path,
         help="(Optional) Path to recs.ndjson (candidate scores dump)",
     )
@@ -125,8 +155,8 @@ def build_config_from_args(args: argparse.Namespace) -> Config:
         args.output_path = Path("./output/result.json")
         args.summary_csv = Path("./log/summary.csv")
         # details는 지정 시에만 생성
-        if args.details_ndjson is None:
-            args.details_ndjson = None
+        if args.details_resultjson is None:
+            args.details_resultjson = None
 
     missing = []
     if not args.catalog_path:
@@ -150,7 +180,7 @@ def build_config_from_args(args: argparse.Namespace) -> Config:
         sys.exit(2)
 
     w = parse_weights(args.weights)
-    # [ASSUMPTION] 키 누락 시 0.0으로 봄(명세 미정)
+    # 키 누락 시 0.0
     w_theme = float(w.get("theme", 0.0))
     w_tag = float(w.get("tag", 0.0))
     w_region = float(w.get("region", 0.0))
@@ -167,7 +197,7 @@ def build_config_from_args(args: argparse.Namespace) -> Config:
         w_recency=w_recency,
         output_path=args.output_path,
         summary_csv=args.summary_csv,
-        details_ndjson=args.details_ndjson,
+        details_resultjson=args.details_resultjson,
     )
 
 
@@ -200,65 +230,91 @@ KST = timezone(timedelta(hours=9))  # 한국 표준시
 
 
 def norm_str(s: Optional[str]) -> str:
-    # [ASSUMPTION] 간단 정규화: strip + lower (유니코드 정규화/동의어 매핑은 미구현)
-    return (s or "").strip().lower()
+    # strip만, 대소문자 변경 없음
+    return (s or "").strip()
 
 
 def norm_tags(xs: Optional[Iterable[str]]) -> List[str]:
-    # [ASSUMPTION] 중복 제거 후 사전순 (TagOverlap 정의 모호 → 집합 겹침으로 가정)
-    return sorted({norm_str(x) for x in (xs or []) if isinstance(x, str)})
+    # 순서 유지 + 중복 제거 + strip만
+    seen: Set[str] = set()
+    out: List[str] = []
+    for x in xs or []:
+        if isinstance(x, str):
+            t = x.strip()
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+    return out
 
 
 WORD_RE = re.compile(r"[A-Za-z0-9가-힣]+", re.UNICODE)
 
 
 def extract_one_word(text: str) -> Optional[str]:
-    # [ASSUMPTION] content에서 "단어 1개" 추출 규칙: 영문/숫자/한글로 이뤄진 첫 토큰
-    # - 불용어 제거 없음
-    # - 부분문자열 금지: 토큰 그대로 사용
+    # 영문/숫자/한글로 이뤄진 첫 토큰(원문 그대로, lower 하지 않음)
     if not text:
         return None
     m = WORD_RE.search(text)
-    return m.group(0).lower() if m else None
+    return m.group(0) if m else None
 
 
 def parse_dt_to_kst(dt_str: str) -> Optional[datetime]:
-    # [ASSUMPTION] ISO8601 가정. 'Z'는 UTC로 보고 KST로 변환. 오프셋 없으면 KST로 간주.
+    """
+    날짜 문자열의 Z/오프셋을 '무시'하고, 해당 로컬 값 그대로 KST로 해석(시차 변환 없음).
+    허용 형태 예:
+      - 2025-08-28T08:00:00Z
+      - 2025-08-28T08:00:00+09:00
+      - 2025-08-28T08:00:00
+      - 2025-08-28T08:00
+    """
     if not dt_str:
         return None
     try:
-        # try fromisoformat (Python 3.11+ 괜찮음)
-        if dt_str.endswith("Z"):
-            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).astimezone(KST)
-        else:
-            dt = datetime.fromisoformat(dt_str)
-            if dt.tzinfo is None:
-                # 오프셋 없으면 KST로 간주
-                dt = dt.replace(tzinfo=KST)
+        s = dt_str.strip()
+        # 오프셋/Z 제거
+        for sep in ["+", "Z", "z"]:
+            pos = s.find(sep)
+            if pos != -1:
+                s = s[:pos]
+                break
+        # 파싱
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$", s):
+                dt = datetime.fromisoformat(s + ":00")
             else:
-                dt = dt.astimezone(KST)
-        return dt
+                return None
+        return dt.replace(tzinfo=KST)
     except Exception:
         return None
 
 
 def kst_bucket(dt: datetime) -> str:
-    # [ASSUMPTION] 시간대 버킷(경계 포함 기준):
-    # morning: 06:00–11:59, afternoon: 12:00–17:59, evening: 18:00–21:59, night: 22:00–05:59
-    h = dt.hour
-    if 6 <= h <= 11:
+    """
+    시간대 버킷(경계 규칙):
+      morning  : [05:00:00, 12:00:00)
+      afternoon: [12:00:00, 17:00:00)
+      evening  : [17:00:00, 22:00:00)
+      night    : [22:00:00, 05:00:00)
+    """
+    t = dt.timetz()
+    mins = t.hour * 60 + t.minute
+    if mins >= 22 * 60 or mins < 5 * 60:
+        return "night"
+    if mins < 12 * 60:
         return "morning"
-    if 12 <= h <= 17:
+    if mins < 17 * 60:
         return "afternoon"
-    if 18 <= h <= 21:
+    if mins < 22 * 60:
         return "evening"
+    # 이론상 도달 안 함
     return "night"
 
 
-def days_diff_floor_kst(newest: datetime, older: datetime) -> int:
-    # [ASSUMPTION] 일수는 내림(floor)으로 계산
-    delta = newest - older
-    return max(0, int(delta.total_seconds() // 86400))
+def days_diff_round_kst(newer: datetime, older: datetime) -> int:
+    delta_days = (newer - older).total_seconds() / 86400.0
+    return max(0, int(round(delta_days)))
 
 
 # =========================
@@ -272,16 +328,18 @@ def prepare_catalog(catalog: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         mid = str(m.get("messageId", "")).strip()
         if not mid:
             continue
+        tags_list = norm_tags(m.get("tags"))
         prepped.append(
             {
                 "messageId": mid,
                 "content": m.get("content", "") or "",
-                "tags_norm": set(norm_tags(m.get("tags"))),
+                "tags_list": tags_list,  # 순서 보존 unique 리스트
+                "tags_set": set(tags_list),  # 교집합용
                 "region_norm": norm_str(m.get("region")),
                 "datetime_kst": parse_dt_to_kst(m.get("datetime") or ""),
             }
         )
-    prepped.sort(key=lambda x: x["messageId"])
+    prepped.sort(key=lambda x: x["messageId"])  # 문자열 오름차순
     return prepped
 
 
@@ -297,60 +355,40 @@ def build_answer_map(answers: Sequence[Dict[str, Any]]) -> Dict[str, str]:
 
 def prepare_scenario(s: Dict[str, Any]) -> Dict[str, Any]:
     # 스키마: scenarioId, theme, context.region, context.time, userHints.prefer/avoid
-    sid = str(s.get("scenarioId", "")).strip() or None
-    theme = norm_str(s.get("theme"))
-
+    sid = str(s.get("scenarioId", "")).strip()  # 빈 값은 허용하지 않음(사전 검증)
     ctx = s.get("context") or {}
-    region = norm_str(ctx.get("region"))
-    time_bucket = norm_str(ctx.get("time"))
-
     uh = s.get("userHints") or {}
-    prefer = set(norm_tags(uh.get("prefer")))
-    avoid = set(norm_tags(uh.get("avoid")))
 
     return {
         "scenarioId": sid,
-        "theme": theme,
-        "region": region,
-        "time": time_bucket,
-        "prefer": prefer,
-        "avoid": avoid,
+        "theme": norm_str(s.get("theme")),
+        "region": norm_str(ctx.get("region")),
+        "time": norm_str(ctx.get("time")),
+        "prefer": set(norm_tags(uh.get("prefer"))),
+        "avoid": set(norm_tags(uh.get("avoid"))),
     }
 
 
-def theme_match(scn_theme: str, msg_tags: set, msg_content: str) -> int:
-    # 정확히 같은 단어 매칭(대소문자 무시), 부분문자열 불허
+def theme_match(scn_theme: str, msg_tags_set: Set[str]) -> int:
     if not scn_theme:
         return 0
-    if scn_theme in msg_tags:
-        return 1
-    # content 단어 토큰화 후 정확 일치 검사
-    # [ASSUMPTION] 동일 WORD_RE 사용
-    if msg_content:
-        for tok in WORD_RE.findall(msg_content.lower()):
-            if tok == scn_theme:
-                return 1
-    return 0
+    return int(scn_theme in msg_tags_set)
 
 
 def region_match(scn_region: str, msg_region: str) -> int:
-    # [ASSUMPTION] 둘 중 하나라도 비면 0점 (정책: zero)
     if not scn_region or not msg_region:
         return 0
     return int(scn_region == msg_region)
 
 
-def tag_overlap(prefer: set, msg_tags: set) -> int:
-    return len(prefer & msg_tags)
+def tag_overlap(prefer: Set[str], msg_tags_set: Set[str]) -> int:
+    return len(prefer & msg_tags_set)
 
 
-def recency_boost(
-    msg_dt_kst: Optional[datetime], newest_kst: Optional[datetime]
-) -> float:
-    # 버킷: ≤7 → 1.0, 8–30 → 0.5, >30 → 0.0 (KST 기준, 일수 내림)
-    if not msg_dt_kst or not newest_kst:
+def recency_boost(msg_dt_kst: Optional[datetime], now_kst: datetime) -> float:
+    if not msg_dt_kst:
         return 0.0
-    d = days_diff_floor_kst(newest_kst, msg_dt_kst)
+    d = days_diff_round_kst(now_kst, msg_dt_kst)
     if d <= 7:
         return 1.0
     if d <= 30:
@@ -382,68 +420,72 @@ def compute_recommendations(
         )
         sys.exit(1)
 
-    # 최신시각(KST) 찾기 (Recency 기준)
-    newest_kst = None
-    for m in cat:
-        dt = m["datetime_kst"]
-        if dt and (newest_kst is None or dt > newest_kst):
-            newest_kst = dt
-
+    cat_by_id = {m["messageId"]: m for m in cat}
     answers_map = build_answer_map(answers)
+
+    # 사전 검증: scenarioId/answer 존재성
+    for idx, s in enumerate(scenarios):
+        sid_raw = str((s.get("scenarioId") or "")).strip()
+        if not sid_raw:
+            print(f"[ERROR] scenarios[{idx}] has empty scenarioId", file=sys.stderr)
+            sys.exit(1)
+        if sid_raw not in answers_map:
+            print(f"[ERROR] answers.json missing scenarioId={sid_raw}", file=sys.stderr)
+            sys.exit(1)
+        aid = answers_map[sid_raw]
+        if aid not in cat_by_id:
+            print(
+                f"[ERROR] answerMessageId not in catalog: scenarioId={sid_raw}, answer={aid}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     results: List[Dict[str, Any]] = []
     hits = 0
+    now_kst = datetime.now(KST)
 
-    for idx, s in enumerate(scenarios):
+    for s in scenarios:
         sp = prepare_scenario(s)
-        sid = sp["scenarioId"] or f"S{idx+1:03d}"
+        sid = sp["scenarioId"]  # 검증상 non-empty
 
         # -------- Simple Mode: 누락 보정 --------
-        # theme
         theme = sp["theme"]
         region = sp["region"]
         time_bucket = sp["time"]
         prefer = sp["prefer"]
-        avoid = sp["avoid"]
+        # avoid는 항상 빈 배열로 덮어씀
+        avoid: Set[str] = set()
 
-        ans_id = answers_map.get(sid)
-        ans_msg = next((m for m in cat if m["messageId"] == ans_id), None)
+        ans_id = answers_map[sid]
+        ans_msg = cat_by_id[ans_id]
 
         # (a) theme 보정
-        if not theme and ans_msg:
-            # [ASSUMPTION] "첫 번째 태그": 카탈로그의 태그 **원래 순서** 대신, 정규화·중복제거로 순서가 사라졌으므로
-            #             여기서는 사전순 첫 태그를 사용함. (원본 순서 유지 명세 없음)
-            tags_sorted = sorted(ans_msg["tags_norm"])
-            if tags_sorted:
-                theme = tags_sorted[0]
+        if not theme:
+            if ans_msg["tags_list"]:
+                theme = ans_msg["tags_list"][0]
             else:
-                # 태그 없으면 content에서 "한 단어"
                 theme = extract_one_word(ans_msg["content"]) or ""
 
         # (b) region 보정
-        if not region and ans_msg:
+        if not region:
             region = ans_msg["region_norm"]
 
         # (c) time 보정
-        if not time_bucket and ans_msg and ans_msg["datetime_kst"]:
+        if not time_bucket and ans_msg["datetime_kst"]:
             time_bucket = kst_bucket(ans_msg["datetime_kst"])
 
-        # (d) userHints 보정
-        if not prefer and ans_msg:
-            tags_sorted = sorted(ans_msg["tags_norm"])
-            # [ASSUMPTION] "상위 2개": 정렬 기준이 불명 → 사전순 2개
-            prefer = set(tags_sorted[:2])
-        if not avoid:
-            avoid = set()  # 명세대로 빈 배열
+        # (d) prefer 보정 (비었을 때만)
+        if not prefer:
+            prefer = set(ans_msg["tags_list"][:2])
 
         # -------- 점수 계산 --------
         scored: List[Tuple[float, str, Dict[str, Any]]] = []
 
         for m in cat:
-            tmatch = theme_match(theme, m["tags_norm"], m["content"])
-            tovl = tag_overlap(prefer, m["tags_norm"])
+            tmatch = theme_match(theme, m["tags_set"])
+            tovl = tag_overlap(prefer, m["tags_set"])
             rmatch = region_match(region, m["region_norm"])
-            rboost = recency_boost(m["datetime_kst"], newest_kst)
+            rboost = recency_boost(m["datetime_kst"], now_kst)
 
             score = (
                 (w_theme * tmatch)
@@ -466,12 +508,12 @@ def compute_recommendations(
                 )
             )
 
-        # 정렬: 점수 내림차순, 동점 시 messageId 오름차순
+        # 정렬: 점수 내림차순, 동점 시 messageId 오름차순(문자열)
         scored.sort(key=lambda x: (-x[0], x[1]))
 
         top_ids = [mid for _, mid, _ in scored[:topk]]
         top1 = top_ids[0] if top_ids else None
-        hit = bool(ans_id and top1 and ans_id == top1)
+        hit = bool(top1 and ans_id == top1)
         if hit:
             hits += 1
 
@@ -484,9 +526,8 @@ def compute_recommendations(
             }
         )
 
-        # details 로그 (선택)
+        # details 로그 (선택, 상위 10개)
         if details_writer is not None:
-            # 상위 10개만 덤프(가독성) [ASSUMPTION]
             for score_val, mid, parts in scored[:10]:
                 details_writer.write(
                     json.dumps(
@@ -508,7 +549,8 @@ def compute_recommendations(
 
 def run(cfg: Config) -> None:
     t0 = perf_counter()
-    start_id = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S%z")
+    # 출력에는 타임존 오프셋 미포함 (KST 기준, naive string)
+    start_id = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
 
     catalog_data = read_json(cfg.catalog_path)
     scenarios_data = read_json(cfg.scenarios_path)
@@ -528,9 +570,9 @@ def run(cfg: Config) -> None:
 
     # details ndjson 준비(옵션)
     details_writer = None
-    if cfg.details_ndjson is not None:
-        ensure_parent(cfg.details_ndjson)
-        details_writer = cfg.details_ndjson.open("w", encoding="utf-8")
+    if cfg.details_resultjson is not None:
+        ensure_parent(cfg.details_resultjson)
+        details_writer = cfg.details_resultjson.open("w", encoding="utf-8")
 
     try:
         results, ctr1 = compute_recommendations(
@@ -549,7 +591,7 @@ def run(cfg: Config) -> None:
             details_writer.close()
 
     elapsed_ms = int((perf_counter() - t0) * 1000)
-    end_id = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S%z")
+    end_id = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
 
     # 출력
     ensure_parent(cfg.output_path)

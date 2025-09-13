@@ -67,37 +67,34 @@ def get_prefer_tags(s: Dict[str, Any]) -> List[str]:
     return safe_tags(hints.get("prefer"))
 
 
-def theme_matches(s_theme: Any, poi_category: Any) -> int:
-    return (
-        1
-        if (
-            s_theme is not None
-            and poi_category is not None
-            and str(s_theme) == str(poi_category)
-        )
-        else 0
-    )
+# =========================
+# 테마 매칭 (태그 기반)
+# =========================
+def normalize_theme_tag(theme: Any) -> Optional[str]:
+    if theme is None:
+        return None
+    t = str(theme).replace(" ", "")
+    return f"테마_{t}"
+
+
+def theme_matches_by_tags(s_theme: Any, poi_tags: List[str]) -> int:
+    ttag = normalize_theme_tag(s_theme)
+    if not ttag:
+        return 0
+    return 1 if ttag in set(safe_tags(poi_tags)) else 0
 
 
 # =========================
 # 점수 계산 & 추천
 # =========================
-def score_poi_for_scenario(s: Dict[str, Any], poi: Dict[str, Any]) -> float:
-    """
-    score = (theme match * 3.0) + (tag overlap * 0.8) – (distance_km * 0.10)
-    """
-    s_theme = s.get("theme")
-    poi_cat = poi.get("category")
-
-    # theme match
-    th = theme_matches(s_theme, poi_cat)
-
-    # tag overlap
+def score_poi_for_scenario(
+    s: Dict[str, Any], poi: Dict[str, Any], weights: Dict[str, float]
+) -> float:
+    th = theme_matches_by_tags(s.get("theme"), poi.get("tags"))
     prefer = set(get_prefer_tags(s))
     poi_tags = set(safe_tags(poi.get("tags")))
     overlap = len(prefer.intersection(poi_tags))
 
-    # distance
     s_lat, s_lng = get_scenario_context_latlng(s)
     p_lat, p_lng = poi.get("lat"), poi.get("lng")
     dist_km = 0.0
@@ -114,42 +111,52 @@ def score_poi_for_scenario(s: Dict[str, Any], poi: Dict[str, Any]) -> float:
     except Exception:
         dist_km = 0.0
 
-    score = (th * 3.0) + (overlap * 0.8) - (dist_km * 0.10)
-    return score
+    return (th * weights["theme"]) + (overlap * weights["tag"]) - (
+        dist_km * weights["dist"]
+    )
 
 
-def recommend_top5_for_scenario(
-    s: Dict[str, Any], catalog: List[Dict[str, Any]]
+def recommend_top_for_scenario(
+    s: Dict[str, Any], catalog: List[Dict[str, Any]], topn: int, weights: Dict[str, float]
 ) -> Tuple[List[str], float]:
-    """
-    catalog 전체를 점수화하고 점수 내림차순, 동점 시 id 오름차순으로 정렬하여 Top-5 ID 반환.
-    top1 점수도 함께 반환.
-    """
     scored: List[Tuple[str, float]] = []
     for poi in catalog:
         pid = to_id(poi.get("id"))
-        sc = score_poi_for_scenario(s, poi)
+        sc = score_poi_for_scenario(s, poi, weights)
         scored.append((pid, sc))
 
     scored.sort(key=lambda x: (-x[1], x[0]))
-    top5_ids = [pid for pid, _ in scored[:5]]
+    top_ids = [pid for pid, _ in scored[:topn]]
     score_top1 = scored[0][1] if scored else float("-inf")
-    return top5_ids, score_top1
+    return top_ids, score_top1
 
 
 # =========================
 # 메인 실행
 # =========================
+def parse_weights(s: str) -> Dict[str, float]:
+    d = {}
+    parts = s.split(",")
+    for part in parts:
+        k, v = part.split("=")
+        d[k.strip()] = float(v.strip())
+    for key in ("theme", "tag", "dist"):
+        if key not in d:
+            raise ValueError(f"weight '{key}' missing in {s}")
+    return d
+
+
 def run_once(
     catalog_path: str,
     scenarios_path: str,
     answers_path: str,
     result_path: str,
-    summary_csv: str,
+    log_csv: str,
+    topn: int,
+    weights: Dict[str, float],
 ) -> None:
     t0 = time.time()
 
-    # 입력 로드
     catalog = read_json_array(catalog_path)
     scenarios = read_json_array(scenarios_path)
     answers = read_json_array(answers_path)
@@ -160,15 +167,17 @@ def run_once(
     results_json: List[Dict[str, Any]] = []
     rows_csv: List[str] = []
     hit5_count = 0
-    hit1_count = 0  # 내부 집계(콘솔에는 미표시)
+    hit1_count = 0
+
+    top_key = f"top{topn}"
 
     for s in scenarios:
         sid = to_id(s.get("scenarioId"))
         answer_id = ans_map.get(sid, "")
 
-        top5_ids, score_top1 = recommend_top5_for_scenario(s, catalog)
-        hit5 = answer_id in top5_ids if answer_id else False
-        hit1 = (answer_id == top5_ids[0]) if (answer_id and top5_ids) else False
+        top_ids, score_top1 = recommend_top_for_scenario(s, catalog, topn, weights)
+        hit5 = answer_id in top_ids if answer_id else False
+        hit1 = (answer_id == top_ids[0]) if (answer_id and top_ids) else False
         if hit5:
             hit5_count += 1
         if hit1:
@@ -180,15 +189,15 @@ def run_once(
                 (p for p in catalog if to_id(p.get("id")) == answer_id), None
             )
             if poi_lookup is not None:
-                score_answer = score_poi_for_scenario(s, poi_lookup)
+                score_answer = score_poi_for_scenario(s, poi_lookup, weights)
 
         results_json.append(
             {
                 "scenarioId": sid,
-                "top5": top5_ids,
+                top_key: top_ids,
                 "answerId": answer_id,
                 "hit": hit5,
-                "hit1": hit1,  # 파일에만 남김
+                "hit1": hit1,
                 "scoreTop1": (
                     round(score_top1, 6)
                     if isinstance(score_top1, (int, float))
@@ -202,34 +211,31 @@ def run_once(
             }
         )
 
-        top5_join = ";".join(top5_ids)
+        top_join = ";".join(top_ids)
         rows_csv.append(
-            f"{sid},{answer_id},{top5_join},{int(hit5)},"
+            f"{sid},{answer_id},{top_join},{int(hit5)},"
             f"{score_top1 if score_top1 is not None else ''},"
             f"{score_answer if score_answer is not None else ''}"
         )
 
-    # CTR 계산
     n = len(scenarios) if scenarios else 1
     ctr5 = hit5_count / n
 
-    # 파일 저장
     ensure_parent_dir(result_path)
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(results_json, f, ensure_ascii=False, indent=2)
 
-    ensure_parent_dir(summary_csv)
-    with open(summary_csv, "w", encoding="utf-8", newline="") as f:
-        f.write("scenarioId,answerId,top5,hit,score_top1,score_answer\n")
+    ensure_parent_dir(log_csv)
+    with open(log_csv, "w", encoding="utf-8", newline="") as f:
+        f.write("scenarioId,answerId,top,hit,score_top1,score_answer\n")
         for line in rows_csv:
             f.write(line + "\n")
 
-    # 콘솔 출력 — 단일 라인 포맷
     samples = []
     for item in results_json[:3]:
         short = {
             "scenarioId": item["scenarioId"],
-            "top5": item["top5"],
+            top_key: item[top_key],
             "answerId": item["answerId"],
             "hit": item["hit"],
         }
@@ -250,9 +256,16 @@ def parse_args():
     p.add_argument("--catalog", help="Path to catalog.json")
     p.add_argument("--scenarios", help="Path to scenarios.json")
     p.add_argument("--answers", help="Path to answers.json")
+    p.add_argument("--topk", type=int, default=5, help="Top-N (default=5)")
+    p.add_argument(
+        "--weights",
+        type=str,
+        default="theme=3.0,tag=0.8,dist=0.10",
+        help='Weights, e.g. "theme=3.0,tag=0.8,dist=0.10"',
+    )
     p.add_argument("--output", help="Path to result.json")
-    p.add_argument("--summary", help="Path to summary.csv")
-    p.add_argument("--test", action="store_true", help="Use predefined test paths")
+    p.add_argument("--log", help="Path to summary.csv")
+    p.add_argument("--test", action="store_true", help="Run with default test paths")
     return p.parse_args()
 
 
@@ -260,30 +273,33 @@ def main():
     args = parse_args()
 
     if args.test:
-        # 요청 사양: senarios.json 철자 유지
         catalog_path = "./input/catalog.json"
         scenarios_path = "./input/scenarios.json"
         answers_path = "./input/answers.json"
+        topn = 5
+        weights = parse_weights("theme=3.0,tag=0.8,dist=0.10")
         result_path = "./output/result.json"
-        summary_csv = "./output/summary.csv"
+        log_csv = "./log/summary.csv"
     else:
         if not (
             args.catalog
             and args.scenarios
             and args.answers
             and args.output
-            and args.summary
+            and args.log
         ):
             raise SystemExit(
-                "the following arguments are required: --catalog --scenarios --answers --output --summary"
+                "the following arguments are required: --catalog --scenarios --answers --output --log"
             )
         catalog_path = args.catalog
         scenarios_path = args.scenarios
         answers_path = args.answers
+        topn = args.topk
+        weights = parse_weights(args.weights)
         result_path = args.output
-        summary_csv = args.summary
+        log_csv = args.log
 
-    run_once(catalog_path, scenarios_path, answers_path, result_path, summary_csv)
+    run_once(catalog_path, scenarios_path, answers_path, result_path, log_csv, topn, weights)
 
 
 if __name__ == "__main__":

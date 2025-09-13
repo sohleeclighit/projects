@@ -6,6 +6,7 @@ import json
 import os
 import time
 import uuid
+import re
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -374,7 +375,8 @@ def build_features(
                     t = pick_event_time(ev)
                     if t is None:
                         continue
-                    if t >= cutoff:
+                    # [cutoff, now_kst] 양끝 포함
+                    if cutoff <= t <= now_kst:
                         counts[kind] += 1
                         included.append((t, kind, ev))
                         total_used += 1
@@ -439,6 +441,22 @@ def build_features(
 
 
 # =========================
+# run_id 추출 유틸 (추가)
+# =========================
+def extract_run_id_from_log_path(log_path: str) -> str:
+    """
+    파일명이 run{n}.csv 또는 run_{n}.csv 이면 run_id=n, 그 외는 '1'
+    - 대소문자 구분 없이 동작
+    - 경로 포함 가능 (basename만 사용)
+    """
+    base = os.path.basename(log_path or "")
+    m = re.match(r"(?i)^run_?(\d+)\.csv$", base)  # run1.csv 또는 run_1.csv
+    if m:
+        return m.group(1)
+    return "1"
+
+
+# =========================
 # 실행
 # =========================
 def run_once(
@@ -471,11 +489,14 @@ def run_once(
     elapsed_ms = int((time.time() - start_monotonic) * 1000)
     end_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
+    # run_id: 규칙 적용 (run{n}.csv / run_{n}.csv → n, 그 외 1)
+    run_id_value = extract_run_id_from_log_path(output_csv)
+
     # 실행 로그(run.csv) — 덮어쓰기
     write_run_csv(
         output_csv,
         {
-            "run_id": uuid.uuid4().hex[:8],
+            "run_id": run_id_value,
             "start_time": start_iso,
             "end_time": end_iso,
             "users": users_count,
@@ -484,8 +505,8 @@ def run_once(
         },
     )
 
-    # 콘솔 출력 (요구 포맷)
-    print(f"elapsed={elapsed_ms}ms, users={users_count}, events_used={events_used}\n")
+    # 콘솔 출력 (기존 포맷 유지)
+    print(f"elapsed={elapsed_ms}ms, users={users_count}, events_used={events_used}")
     print("Sample results (top 5):")
     for item in results[:5]:
         print(json.dumps(item, ensure_ascii=False))
