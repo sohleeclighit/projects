@@ -5,7 +5,6 @@ import argparse
 import json
 import os
 import time
-import uuid
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -121,7 +120,9 @@ def step1_deduplicate(
     for _, items in groups.items():
         # 최신순으로 정렬
         items_sorted = sorted(
-            items, key=lambda x: parse_iso8601_utc(x.get("updated_at")), reverse=True
+            items, 
+            key=lambda x: parse_iso8601_utc(x.get("updated_at")), 
+            reverse=True
         )
         cluster_centers: List[Dict[str, Any]] = []
         for cand in items_sorted:
@@ -232,17 +233,24 @@ def extract_run_id_from_log_path(log_path: str) -> str:
     return "1"
 
 
+def get_iso8601_utc_now() -> str:
+    """현재 시간을 ISO8601 UTC 형식으로 반환"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def write_run_csv_overwrite(
-    csv_path: str, run_id: str, input_size: int, output_size: int, elapsed_ms: int
+    csv_path: str, run_id: str, input_size: int, output_size: int, 
+    elapsed_ms: int, started_at: str, finished_at: str, status: str = "OK"
 ) -> None:
     """
     매 실행 시 같은 경로면 덮어쓰기(헤더 + 단일 결과 1행).
     기존 append 동작을 overwrite로 변경.
+    새로운 형식: run_id,started_at,finished_at,elapsed_ms,input_size,output_size,status
     """
     ensure_parent_dir(csv_path)
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        f.write("run_id,input,output,elapsed_ms\n")
-        f.write(f"{run_id},{input_size},{output_size},{elapsed_ms}\n")
+        f.write("run_id,started_at,finished_at,elapsed_ms,input_size,output_size,status\n")
+        f.write(f"{run_id},{started_at},{finished_at},{elapsed_ms},{input_size},{output_size},{status}\n")
 
 
 def run_once(
@@ -251,31 +259,49 @@ def run_once(
     ensure_parent_dir(output_file)
     ensure_parent_dir(csv_file)
 
+    # 시작 시간 기록
+    started_at = get_iso8601_utc_now()
     t0 = time.time()
+    processed = []  # 초기화
 
-    # ===== 입력 로드 =====
-    with open(input_file, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-        if not isinstance(raw, list):
-            raise ValueError("Input JSON must be a list of marker objects.")
-        # 원본 순서 보존용 인덱스 부여
-        for i, m in enumerate(raw):
-            if isinstance(m, dict):
-                m["_idx"] = i
-        input_size = len(raw)
+    try:
+        # ===== 입력 로드 =====
+        with open(input_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+            if not isinstance(raw, list):
+                raise ValueError(
+                    "Input JSON must be a list of marker objects."
+                )
+            # 원본 순서 보존용 인덱스 부여
+            for i, m in enumerate(raw):
+                if isinstance(m, dict):
+                    m["_idx"] = i
+            input_size = len(raw)
 
-    # ===== 변환 =====
-    processed = transform_markers(raw)
-    output_size = len(processed)
+        # ===== 변환 =====
+        processed = transform_markers(raw)
+        output_size = len(processed)
 
-    # ===== 파일 출력 =====
-    # (1) result.json (내부 키 제거)
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(
-            [strip_internal_keys(x) for x in processed], f, ensure_ascii=False, indent=2
-        )
+        # ===== 파일 출력 =====
+        # (1) result.json (내부 키 제거)
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(
+                [strip_internal_keys(x) for x in processed], 
+                f, ensure_ascii=False, indent=2
+            )
 
-    elapsed_ms = int((time.time() - t0) * 1000)
+        elapsed_ms = int((time.time() - t0) * 1000)
+        finished_at = get_iso8601_utc_now()
+        status = "OK"
+
+    except Exception as e:
+        # 에러 발생 시에도 로그 기록
+        elapsed_ms = int((time.time() - t0) * 1000)
+        finished_at = get_iso8601_utc_now()
+        input_size = 0
+        output_size = 0
+        status = f"ERROR: {str(e)}"
+        print(f"Error occurred: {e}")
 
     # (2) run.csv overwrite
     #     - run_id 우선순위: (a) 인자로 받은 run_id -> (b) --log 경로에서 추출 -> (c) "1"
@@ -284,17 +310,25 @@ def run_once(
         or extract_run_id_from_log_path(csv_file)
         or "1"
     )
-    write_run_csv_overwrite(csv_file, resolved_run_id, input_size, output_size, elapsed_ms)
+    write_run_csv_overwrite(
+        csv_file, resolved_run_id, input_size, output_size, 
+        elapsed_ms, started_at, finished_at, status
+    )
 
     # (3) 콘솔 출력 (요약 + top5만)
     print(f"elapsed={elapsed_ms}ms, input={input_size}, output={output_size}")
-    print("Sample results (top 5):")
-    top5 = processed[:5]
-    if top5:
-        for item in top5:
-            print(json.dumps(strip_internal_keys(item), ensure_ascii=False))
+    if status == "OK":
+        print("Sample results (top 5):")
+        top5 = processed[:5]
+        if top5:
+            for item in top5:
+                print(json.dumps(
+                    strip_internal_keys(item), ensure_ascii=False
+                ))
+        else:
+            print("(no results)")
     else:
-        print("(no results)")
+        print(f"Status: {status}")
 
 
 # =========================
